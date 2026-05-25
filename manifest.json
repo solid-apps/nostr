@@ -1,0 +1,11 @@
+{
+  "name": "nostr — your Solid pod",
+  "short_name": "nostr",
+  "description": "Your Nostr control center — inspect your profile, manage and generate keys (the bridge to your WebID), discover the Nostr-native apps, and learn how it all fits together.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f3ff",
+  "theme_color": "#7c3aed",
+  "icons": [ { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" } ]
+}
