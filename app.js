@@ -45,14 +45,6 @@ async function npub(hex) { try { const { bech32 } = await base(); return bech32.
 async function nsec(hex) { try { const { bech32 } = await base(); return bech32.encode('nsec', bech32.toWords(hexToBytes(hex))) } catch { return '' } }
 async function decodeBech(str) { const { bech32 } = await base(); const d = bech32.decode(str); return { prefix: d.prefix, hex: bytesToHex(bech32.fromWords(d.words)) } }
 
-// Curated Nostr-native apps in the suite (relay-backed → reachable today).
-const NOSTR_APPS = [
-  { id: 'plaza', emoji: '🪧', label: 'Plaza', what: 'Slack-shaped group chat on the open web, over relays.' },
-  { id: 'timeline', emoji: '🌐', label: 'Timeline', what: 'A decentralized social feed — your posts on your pod, broadcast to Nostr.' },
-  { id: 'hub', emoji: '🧩', label: 'Hub', what: 'Multi-app workspace; opens any pod resource in the right app.' },
-  { id: 'charlie', emoji: '🤖', label: 'Charlie', what: 'A pod-resident bot you can reach over Nostr DMs.' },
-  { id: 'messages', emoji: '💬', label: 'Messages', what: 'Direct messages — NIP-04 encrypted between two keys.' }
-]
 const DEFAULT_RELAYS = ['wss://nos.lol', 'wss://relay.damus.io']
 
 let KEYS = []        // [{ label, pubkey(hex), secret(hex|null), source, created, primary }]
@@ -260,12 +252,7 @@ async function paintApps(p) {
         <button class="mini gokeys">🔑 my keys</button></div>
     </div>
 
-    <h3>On your pod</h3>
-    <p class="sub muted">Relay-backed apps in this suite — they work over a real network today.</p>
-    <div class="gallery pod"></div>
-
-    <h3>Nostr ecosystem</h3>
-    <p class="sub muted">Real Nostr clients — sign in to any with the same key. <span class="src-link"><a href="https://nostrapps.com/" target="_blank" rel="noopener">more at nostrapps.com ↗</a></span></p>
+    <p class="sub muted">Real Nostr clients — sign in to any with the same key (npub to read, nsec or a signer to post). <span class="src-link"><a href="https://nostrapps.com/" target="_blank" rel="noopener">more at nostrapps.com ↗</a></span></p>
     <div class="cat-filter"></div>
     <div class="gallery eco"></div>`
 
@@ -273,14 +260,6 @@ async function paintApps(p) {
   const npubEl = p.querySelector('.npub'); if (npubEl && npubEl.dataset.hex) npub(npubEl.dataset.hex).then((v) => { npubEl.textContent = v || '(bech32 unavailable)' })
   const cpn = p.querySelector('.cp-npub'); if (cpn) cpn.onclick = async () => copy(await npub(cpn.dataset.hex))
   p.querySelector('.gokeys').onclick = () => { TAB = 'keys'; paint() }
-
-  // on-pod apps
-  const pod = p.querySelector('.gallery.pod')
-  NOSTR_APPS.forEach((a) => {
-    const el = document.createElement('a'); el.className = 'card app'; el.href = `../${a.id}/`
-    el.innerHTML = `<span class="ae">${a.emoji}</span><div><b>${esc(a.label)}</b><small>${esc(a.what)}</small></div><span class="open">Open ↗</span>`
-    pod.appendChild(el)
-  })
 
   // ecosystem (lazy-load once)
   const eco = p.querySelector('.gallery.eco')
