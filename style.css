@@ -81,13 +81,31 @@ h3 { font-size: .98rem; margin: 18px 0 4px; }
 .empty { color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: 14px; padding: 22px; text-align: center; }
 
 /* gallery */
-.gallery { display: grid; gap: 10px; }
+.gallery { display: grid; gap: 10px; margin-bottom: 8px; }
 .card.app { display: flex; align-items: center; gap: 13px; text-decoration: none; color: var(--text); }
 .card.app:hover { border-color: var(--accent); }
 .card.app .ae { font-size: 1.5rem; }
 .card.app b { display: block; }
 .card.app small { color: var(--muted); font-size: .82rem; }
-.card.app .open { margin-left: auto; color: var(--accent); font-size: .8rem; font-weight: 700; white-space: nowrap; }
+.card.app .open { margin-left: auto; color: var(--accent); font-size: .8rem; font-weight: 700; white-space: nowrap; align-self: flex-start; }
+.card.app .app-main { flex: 1; }
+.tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.tag { font-size: .66rem; font-weight: 600; color: var(--muted); background: var(--surface-2); border-radius: 6px; padding: 2px 7px; text-transform: lowercase; }
+
+/* login strip */
+.login-strip { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; background: var(--accent-soft); border-color: #ddd0ff; }
+.login-strip b { font-size: .95rem; }
+.login-strip small { display: block; color: var(--muted); font-size: .8rem; margin-top: 2px; }
+.login-key { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.login-key code { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-link a { font-size: .8rem; }
+
+/* category filter */
+.cat-filter { display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 12px; scrollbar-width: none; }
+.cat-filter::-webkit-scrollbar { display: none; }
+.chip { flex: 0 0 auto; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; font-size: .78rem; font-weight: 600; color: var(--muted); }
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* relays */
 .card.relay { display: flex; align-items: center; gap: 10px; padding: 11px 14px; }

@@ -59,6 +59,8 @@ let KEYS = []        // [{ label, pubkey(hex), secret(hex|null), source, created
 let RELAYS = []
 let CARDDOC = null
 let TAB = 'identity'
+let ECO = null       // wider Nostr ecosystem directory (lazy-loaded JSON)
+let ECO_CAT = 'All'
 
 const toast = (m, err) => { let t = document.querySelector('.toast'); if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t) } t.className = 'toast' + (err ? ' error' : ''); t.textContent = m; requestAnimationFrame(() => t.classList.add('show')); setTimeout(() => t.classList.remove('show'), 2400) }
 async function copy(t) { try { await navigator.clipboard.writeText(t); toast('Copied') } catch { toast('Copy failed', true) } }
@@ -246,13 +248,57 @@ function revealSecret(k) {
   dlg.showModal()
 }
 
-function paintApps(p) {
-  p.innerHTML = `<h2>Nostr apps</h2><p class="sub muted">Relay-backed apps in the suite — these work over a real network today, regardless of pod reachability.</p><div class="gallery"></div>`
-  const g = p.querySelector('.gallery')
+const PLAT = { web: 'web', ios: 'iOS', android: 'Android', desktop: 'desktop', ext: 'extension' }
+
+async function paintApps(p) {
+  p.innerHTML = `
+    <h2>Apps</h2>
+    <div class="login-strip card">
+      <div><b>One key, every app.</b><small>Your <b>npub</b> is your handle; your <b>nsec</b> (or a signer like Amber / Alby / nos2x) signs. Same identity everywhere.</small></div>
+      <div class="login-key"><code class="mono npub" data-hex="${esc(subjectHex() || '')}">${subjectHex() ? '…' : 'no key yet'}</code>
+        ${subjectHex() ? '<button class="mini cp-npub" data-hex="' + esc(subjectHex()) + '">⧉ npub</button>' : ''}
+        <button class="mini gokeys">🔑 my keys</button></div>
+    </div>
+
+    <h3>On your pod</h3>
+    <p class="sub muted">Relay-backed apps in this suite — they work over a real network today.</p>
+    <div class="gallery pod"></div>
+
+    <h3>Nostr ecosystem</h3>
+    <p class="sub muted">Real Nostr clients — sign in to any with the same key. <span class="src-link"><a href="https://nostrapps.com/" target="_blank" rel="noopener">more at nostrapps.com ↗</a></span></p>
+    <div class="cat-filter"></div>
+    <div class="gallery eco"></div>`
+
+  // login strip
+  const npubEl = p.querySelector('.npub'); if (npubEl && npubEl.dataset.hex) npub(npubEl.dataset.hex).then((v) => { npubEl.textContent = v || '(bech32 unavailable)' })
+  const cpn = p.querySelector('.cp-npub'); if (cpn) cpn.onclick = async () => copy(await npub(cpn.dataset.hex))
+  p.querySelector('.gokeys').onclick = () => { TAB = 'keys'; paint() }
+
+  // on-pod apps
+  const pod = p.querySelector('.gallery.pod')
   NOSTR_APPS.forEach((a) => {
     const el = document.createElement('a'); el.className = 'card app'; el.href = `../${a.id}/`
     el.innerHTML = `<span class="ae">${a.emoji}</span><div><b>${esc(a.label)}</b><small>${esc(a.what)}</small></div><span class="open">Open ↗</span>`
-    g.appendChild(el)
+    pod.appendChild(el)
+  })
+
+  // ecosystem (lazy-load once)
+  const eco = p.querySelector('.gallery.eco')
+  const filt = p.querySelector('.cat-filter')
+  if (!ECO) {
+    eco.innerHTML = '<div class="muted" style="padding:8px">Loading directory…</div>'
+    try { const r = await fetch('./nostr-ecosystem.json'); ECO = r.ok ? await r.json() : { apps: [], categories: [] } } catch { ECO = { apps: [], categories: [] } }
+  }
+  const cats = ['All', ...(ECO.categories || [])]
+  filt.innerHTML = cats.map((c) => `<button class="chip ${c === ECO_CAT ? 'on' : ''}">${esc(c)}</button>`).join('')
+  filt.querySelectorAll('.chip').forEach((b, i) => { b.onclick = () => { ECO_CAT = cats[i]; paint() } })
+  eco.innerHTML = ''
+  const apps = (ECO.apps || []).filter((a) => ECO_CAT === 'All' || (a.cats || []).includes(ECO_CAT))
+  apps.forEach((a) => {
+    const el = document.createElement('a'); el.className = 'card app ext'; el.href = a.url; el.target = '_blank'; el.rel = 'noopener'
+    const tags = (a.platforms || []).map((pl) => `<span class="tag">${esc(PLAT[pl] || pl)}</span>`).join('')
+    el.innerHTML = `<div class="app-main"><b>${esc(a.name)}</b><small>${esc(a.what)}</small><div class="tags">${tags}</div></div><span class="open">Open ↗</span>`
+    eco.appendChild(el)
   })
 }
 
