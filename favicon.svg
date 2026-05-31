@@ -1,6 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <rect width="24" height="24" rx="5" fill="#2a3140"/>
-  <g fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" transform="translate(2.4 2.4) scale(0.8)">
-    <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="116" fill="#7c3aed"/>
+  <g fill="#fff">
+    <!-- legs (drawn first, behind body) -->
+    <path d="M214 330 v118 l-30 28" fill="none" stroke="#fff" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M262 330 v112 l30 26" fill="none" stroke="#fff" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- body + neck silhouette -->
+    <path d="M232 248
+             q-2 -70 46 -110
+             q34 -28 70 -28
+             q24 0 24 22
+             q0 14 -16 18
+             q-40 10 -60 42
+             q-18 30 -16 70
+             q70 14 78 84
+             q8 78 -78 92
+             q-104 16 -150 -54
+             q-34 -54 4 -110
+             q26 -38 74 -42 Z"/>
+    <!-- tail tuft -->
+    <path d="M118 252 q-46 -16 -70 14 q34 18 70 8 Z"/>
+    <!-- head -->
+    <circle cx="356" cy="118" r="32"/>
+    <!-- beak -->
+    <path d="M384 106 l54 6 -46 30 Z" fill="#fbbf24"/>
+    <!-- eye -->
+    <circle cx="364" cy="110" r="6.5" fill="#7c3aed"/>
   </g>
 </svg>
