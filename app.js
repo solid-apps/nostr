@@ -25,6 +25,8 @@ const toArr = (v) => v == null ? [] : Array.isArray(v) ? v : [v]
 const CARD = new URL('../../../profile/card.jsonld', location.href)
 const KEYSTORE = new URL('../../../private/nostr/keys.jsonld', location.href)
 const PRIV_DIR = new URL('../../../private/nostr/', location.href)
+const POD_ROOT = new URL('../../../', location.href)
+const PROFILE_DIR = new URL('../../../profile/', location.href)
 
 // --- canonical-key plumbing (hex is the source of truth) ---
 const isHex64 = (s) => /^[0-9a-f]{64}$/i.test(s || '')
@@ -53,6 +55,7 @@ let CARDDOC = null
 let TAB = 'identity'
 let ECO = null       // wider Nostr ecosystem directory (lazy-loaded JSON)
 let ECO_CAT = 'All'
+let PROFILE = null   // working kind-0 metadata model for the Profile tab
 
 const toast = (m, err) => { let t = document.querySelector('.toast'); if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t) } t.className = 'toast' + (err ? ' error' : ''); t.textContent = m; requestAnimationFrame(() => t.classList.add('show')); setTimeout(() => t.classList.remove('show'), 2400) }
 async function copy(t) { try { await navigator.clipboard.writeText(t); toast('Copied') } catch { toast('Copy failed', true) } }
@@ -104,9 +107,101 @@ async function linkKeyToProfile(hex) {
   if (!r.ok) throw new Error('profile write ' + r.status)
 }
 
+// ---- nostr events: build, sign (schnorr), publish to relays ----
+// A profile is a kind-0 "metadata" event; content is a JSON blob and the
+// 32-byte event id (sha256 of the canonical array) is what gets signed.
+function serializeEvent(e) { return JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content]) }
+async function sha256hex(str) { const s = await secp(); const h = await s.utils.sha256(new TextEncoder().encode(str)); return s.utils.bytesToHex(h) }
+async function signEvent(unsigned, secretHex) {
+  const s = await secp()
+  const e = { pubkey: unsigned.pubkey, created_at: unsigned.created_at, kind: unsigned.kind, tags: unsigned.tags || [], content: unsigned.content }
+  e.id = await sha256hex(serializeEvent(e))
+  e.sig = s.utils.bytesToHex(await s.schnorr.sign(e.id, secretHex))
+  return e
+}
+
+// Publish to one relay; resolves { url, ok, msg } on the relay's OK / error / timeout.
+function publishToRelay(url, evt) {
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (ok, msg, ws, t) => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close() } catch {} resolve({ url, ok, msg }) }
+    try {
+      const ws = new WebSocket(url)
+      const t = setTimeout(() => finish(false, 'timeout', ws), 7000)
+      ws.onopen = () => ws.send(JSON.stringify(['EVENT', evt]))
+      ws.onmessage = (m) => { try { const d = JSON.parse(m.data); if (d[0] === 'OK' && d[1] === evt.id) finish(d[2] === true, d[3] || (d[2] ? 'accepted' : 'rejected'), ws, t) } catch {} }
+      ws.onerror = () => finish(false, 'connection error', ws, t)
+    } catch (e) { resolve({ url, ok: false, msg: String(e.message || e) }) }
+  })
+}
+async function publishEvent(evt) { return Promise.all(RELAYS.map((u) => publishToRelay(u, evt))) }
+
+// Best-effort fetch of the newest kind-0 for a pubkey across relays (to prefill the form).
+function fetchKind0FromRelay(url, hex) {
+  return new Promise((resolve) => {
+    let best = null, done = false
+    const finish = (ws, t) => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close() } catch {} resolve(best) }
+    try {
+      const ws = new WebSocket(url); const sub = 'p' + hex.slice(0, 8)
+      const t = setTimeout(() => finish(ws), 6000)
+      ws.onopen = () => ws.send(JSON.stringify(['REQ', sub, { authors: [hex], kinds: [0], limit: 1 }]))
+      ws.onmessage = (m) => { try { const d = JSON.parse(m.data); if (d[0] === 'EVENT' && d[1] === sub) { const ev = d[2]; if (!best || ev.created_at > best.created_at) best = ev } else if ((d[0] === 'EOSE' || d[0] === 'CLOSED') && d[1] === sub) finish(ws, t) } catch {} }
+      ws.onerror = () => finish(ws, t)
+    } catch { resolve(null) }
+  })
+}
+async function fetchCurrentProfile(hex) {
+  const evs = (await Promise.all(RELAYS.map((u) => fetchKind0FromRelay(u, hex)))).filter(Boolean)
+  const best = evs.sort((a, b) => b.created_at - a.created_at)[0]
+  if (!best) return null
+  try { return JSON.parse(best.content) } catch { return null }
+}
+
+// ---- WebID card alignment (read + write name/avatar) ----
+function firstOf(obj, keys) { for (const k of keys) { const v = obj && obj[k]; if (v != null) return (typeof v === 'object') ? (v['@id'] || v['@value'] || (Array.isArray(v) ? firstOf({ a: v[0] }, ['a']) : null)) : v } return null }
+function cardName() { return CARDDOC ? firstOf(CARDDOC, ['name', 'foaf:name', 'http://xmlns.com/foaf/0.1/name', 'vcard:fn', 'fn']) : null }
+function cardAvatar() { return CARDDOC ? firstOf(CARDDOC, ['img', 'foaf:img', 'http://xmlns.com/foaf/0.1/img', 'picture', 'vcard:hasPhoto', 'hasPhoto']) : null }
+
+// Additive, namespaced write-back so the WebID card mirrors the Nostr profile.
+async function writeProfileToCard(name, picture) {
+  if (!CARDDOC) await loadCard()
+  if (!CARDDOC) throw new Error('No profile card to update')
+  let ctx = CARDDOC['@context']
+  if (ctx == null) ctx = [{}]
+  if (typeof ctx === 'string') ctx = [ctx, {}]
+  if (Array.isArray(ctx)) { if (!ctx.some((c) => c && typeof c === 'object')) ctx.push({}) } else ctx = [ctx]
+  const cobj = ctx.find((c) => c && typeof c === 'object')
+  cobj.foaf = cobj.foaf || 'http://xmlns.com/foaf/0.1/'
+  CARDDOC['@context'] = ctx
+  // Update an existing name/img key if the card already uses one, else use foaf:*.
+  if (name) { const k = ['name', 'foaf:name'].find((x) => x in CARDDOC) || 'foaf:name'; CARDDOC[k] = name }
+  if (picture) { const k = ['img', 'foaf:img'].find((x) => x in CARDDOC) || 'foaf:img'; CARDDOC[k] = { '@id': picture } }
+  const r = await authFetch(CARD, { method: 'PUT', headers: { 'Content-Type': 'application/ld+json' }, body: JSON.stringify(CARDDOC, null, 2) })
+  if (!r.ok) throw new Error('card write ' + r.status)
+}
+
+// Upload an image into the pod's /profile/ and return its URL (so WebID + Nostr share one file).
+async function uploadAvatar(file) {
+  const ext = ((file.name.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '') || 'png')
+  const dest = new URL('avatar.' + ext, PROFILE_DIR)
+  const r = await authFetch(dest, { method: 'PUT', headers: { 'Content-Type': file.type || 'application/octet-stream' }, body: await file.arrayBuffer() })
+  if (!r.ok) throw new Error('upload ' + r.status)
+  return dest.href
+}
+
+// NIP-05: make the pod the verifier. '_' is the root identifier → displays as just the domain.
+const nip05Default = () => '_@' + location.host
+async function writeWellKnown(hex) {
+  const url = location.origin + '/.well-known/nostr.json'
+  const doc = { names: { _: hex }, relays: { [hex]: RELAYS } }
+  const r = await authFetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc, null, 2) })
+  return r.ok
+}
+
 // ---- render ----
 const TABS = [
   { id: 'identity', emoji: '🪪', label: 'Identity' },
+  { id: 'profile', emoji: '🦤', label: 'Profile' },
   { id: 'keys', emoji: '🔑', label: 'Keys' },
   { id: 'apps', emoji: '🧩', label: 'Apps' },
   { id: 'relays', emoji: '📡', label: 'Relays' },
@@ -130,7 +225,7 @@ function paint() {
     tabs.appendChild(b)
   })
   const panel = appEl.querySelector('.panel')
-  ;({ identity: paintIdentity, keys: paintKeys, apps: paintApps, relays: paintRelays, guide: paintGuide }[TAB])(panel)
+  ;({ identity: paintIdentity, profile: paintProfile, keys: paintKeys, apps: paintApps, relays: paintRelays, guide: paintGuide }[TAB])(panel)
 }
 
 function check(ok, label, detail) {
@@ -162,6 +257,100 @@ async function paintIdentity(p) {
   p.querySelectorAll('.cp').forEach((b) => { b.onclick = () => copy(b.dataset.v) })
   const npubEl = p.querySelector('.npub'); if (npubEl) npub(npubEl.dataset.hex).then((v) => { npubEl.textContent = v || '(bech32 unavailable)' })
   const cpn = p.querySelector('.cp-npub'); if (cpn) cpn.onclick = async () => copy(await npub(cpn.dataset.hex))
+}
+
+function paintProfile(p) {
+  const hex = subjectHex()
+  const held = hex ? KEYS.find((k) => k.pubkey === hex && k.secret) : null
+  const m = PROFILE || {}
+  const v = {
+    name: m.name != null ? m.name : (cardName() || ''),
+    about: m.about || '',
+    picture: m.picture != null ? m.picture : (cardAvatar() || ''),
+    website: m.website != null ? m.website : POD_ROOT.href,
+    nip05: m.nip05 != null ? m.nip05 : nip05Default()
+  }
+  if (!hex) { p.innerHTML = '<h2>Profile</h2><div class="empty">No key yet. Generate or import one in the <b>Keys</b> tab, then come back to publish your profile.</div>'; return }
+  p.innerHTML = `
+    <h2>Profile</h2>
+    <p class="sub muted">Your public Nostr profile (kind&nbsp;0). Publishing signs it with your key and broadcasts to your relays — and keeps your <b>WebID card</b> in sync.</p>
+    ${held ? '' : `<div class="warn">This app doesn’t hold the secret for your active key, so it can’t sign. Import its <code>nsec</code> in the <b>Keys</b> tab first. <button class="mini gokeys" style="margin-left:6px">🔑 Keys</button></div>`}
+    <div class="pform">
+      <label class="fld"><span class="fl">Display name</span><input class="f-name" placeholder="Your name" value="${esc(v.name)}"></label>
+      <label class="fld"><span class="fl">About</span><textarea class="f-about" rows="3" placeholder="A short bio">${esc(v.about)}</textarea></label>
+      <label class="fld"><span class="fl">Avatar</span>
+        <div class="avrow">
+          <img class="avprev" alt="" ${v.picture ? `src="${esc(v.picture)}"` : 'style="display:none"'}>
+          <input class="f-pic" placeholder="https://… image URL" value="${esc(v.picture)}">
+          <button class="mini up" type="button">⤴ Upload to pod</button>
+          <input class="f-file" type="file" accept="image/*" hidden>
+        </div>
+      </label>
+      <label class="fld"><span class="fl">Website</span><input class="f-web" value="${esc(v.website)}"></label>
+      <label class="fld"><span class="fl">NIP-05 (pod handle)</span><input class="f-nip" value="${esc(v.nip05)}"></label>
+      <label class="chk"><input type="checkbox" class="f-sync" checked> Also update my WebID card (name + avatar)</label>
+      <label class="chk"><input type="checkbox" class="f-wk" checked> Host NIP-05 on my pod (<code>/.well-known/nostr.json</code>)</label>
+    </div>
+    <div class="key-actions">
+      <button class="ghost pull">↧ Pull from WebID</button>
+      <button class="ghost fetch">↺ Fetch current from relays</button>
+      <button class="primary publish" ${held ? '' : 'disabled'}>Publish to relays</button>
+    </div>
+    <div class="pub-status"></div>`
+
+  const $ = (s) => p.querySelector(s)
+  const readForm = () => ({ name: $('.f-name').value.trim(), about: $('.f-about').value.trim(), picture: $('.f-pic').value.trim(), website: $('.f-web').value.trim(), nip05: $('.f-nip').value.trim() })
+  const gokeys = p.querySelector('.gokeys'); if (gokeys) gokeys.onclick = () => { TAB = 'keys'; paint() }
+
+  const prev = $('.avprev'); const picIn = $('.f-pic')
+  picIn.oninput = () => { if (picIn.value.trim()) { prev.src = picIn.value.trim(); prev.style.display = '' } else prev.style.display = 'none' }
+
+  $('.up').onclick = () => $('.f-file').click()
+  $('.f-file').onchange = async (e) => {
+    const file = e.target.files[0]; if (!file) return
+    toast('Uploading avatar…')
+    try { const url = await uploadAvatar(file); picIn.value = url; picIn.dispatchEvent(new Event('input')); toast('Avatar uploaded to pod') }
+    catch (err) { toast('Upload failed: ' + (err.message || err), true) }
+  }
+
+  $('.pull').onclick = () => { PROFILE = { ...readForm(), name: cardName() || '', picture: cardAvatar() || '' }; paint(); toast('Pulled name + avatar from WebID') }
+
+  $('.fetch').onclick = async () => {
+    toast('Fetching from relays…')
+    const cur = await fetchCurrentProfile(hex)
+    if (!cur) { toast('No published profile found', true); return }
+    PROFILE = { name: cur.name || cur.display_name || '', about: cur.about || '', picture: cur.picture || '', website: cur.website || POD_ROOT.href, nip05: cur.nip05 || nip05Default() }
+    paint(); toast('Loaded your published profile')
+  }
+
+  const pubBtn = $('.publish'); if (pubBtn) pubBtn.onclick = async () => {
+    if (!held) { toast('No held secret to sign with', true); return }
+    const f = readForm(); PROFILE = { ...f }
+    const content = {}
+    if (f.name) content.name = f.name
+    if (f.about) content.about = f.about
+    if (f.picture) content.picture = f.picture
+    if (f.website) content.website = f.website
+    if (f.nip05) content.nip05 = f.nip05
+    const status = $('.pub-status'); pubBtn.disabled = true; status.innerHTML = '<div class="muted">Signing & publishing…</div>'
+    try {
+      const evt = await signEvent({ pubkey: hex, created_at: Math.floor(Date.now() / 1000), kind: 0, tags: [], content: JSON.stringify(content) }, held.secret)
+      const results = await publishEvent(evt)
+      const ok = results.filter((r) => r.ok).length
+      // alignment side-effects (best-effort, reported individually)
+      const extras = []
+      if ($('.f-sync').checked) { try { await writeProfileToCard(f.name, f.picture); await loadCard(); extras.push('<li class="ok"><span class="ci">✅</span><div>WebID card updated (name + avatar)</div></li>') } catch (e) { extras.push(`<li class="no"><span class="ci">⚠️</span><div>WebID card not updated: ${esc(e.message || e)}</div></li>`) } }
+      if ($('.f-wk').checked) { try { const wk = await writeWellKnown(hex); extras.push(wk ? '<li class="ok"><span class="ci">✅</span><div>NIP-05 hosted at <code>/.well-known/nostr.json</code></div></li>' : '<li class="no"><span class="ci">⚠️</span><div>Could not host NIP-05 (pod may not allow writing <code>/.well-known/</code>) — handle will show unverified</div></li>') } catch (e) { extras.push(`<li class="no"><span class="ci">⚠️</span><div>NIP-05 hosting failed: ${esc(e.message || e)}</div></li>`) } }
+      status.innerHTML = `
+        <ul class="checks pubres">
+          ${results.map((r) => `<li class="${r.ok ? 'ok' : 'no'}"><span class="ci">${r.ok ? '✅' : '⛔'}</span><div><b>${esc(r.url)}</b><small>${esc(r.msg)}</small></div></li>`).join('')}
+          ${extras.join('')}
+        </ul>
+        <div class="evid muted">event id <code class="mono">${esc(evt.id)}</code></div>`
+      toast(ok ? `Published to ${ok}/${results.length} relays` : 'No relay accepted the event', !ok)
+    } catch (e) { status.innerHTML = `<div class="warn">Publish failed: ${esc(e.message || e)}</div>`; toast('Publish failed', true) }
+    finally { pubBtn.disabled = false }
+  }
 }
 
 function paintKeys(p) {

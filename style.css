@@ -107,6 +107,24 @@ h3 { font-size: .98rem; margin: 18px 0 4px; }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
 .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 
+/* profile form */
+.pform { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+.fld { display: flex; flex-direction: column; gap: 5px; }
+.fld .fl { font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); font-weight: 700; }
+.pform input, .pform textarea { font: inherit; color: var(--text); background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; width: 100%; }
+.pform input:focus, .pform textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.pform textarea { resize: vertical; }
+.avrow { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.avrow .f-pic { flex: 1; min-width: 180px; }
+.avprev { width: 44px; height: 44px; border-radius: 12px; object-fit: cover; border: 1px solid var(--border); background: var(--surface); flex: 0 0 auto; }
+.chk { display: flex; align-items: center; gap: 8px; font-size: .85rem; color: var(--muted); }
+.chk input { width: auto; }
+.chk code { background: var(--surface); border: 1px solid var(--border); padding: 0 4px; border-radius: 4px; font-size: .85em; }
+.pubres { margin-top: 6px; }
+.pubres li.no { border-color: #f3c9c9; }
+.pubres small { color: var(--muted); font-size: .76rem; }
+.evid { font-size: .76rem; margin-top: 4px; }
+
 /* relays */
 .card.relay { display: flex; align-items: center; gap: 10px; padding: 11px 14px; }
 .card.relay code { flex: 1; }
