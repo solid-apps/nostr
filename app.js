@@ -334,10 +334,21 @@ async function fetchDMs(myHex, theirHex) {
   for (const e of [...a, ...b]) if (e && !seen.has(e.id)) { seen.add(e.id); evs.push(e) }
   return evs.sort((x, y) => x.created_at - y.created_at)
 }
-async function sendDM(secret, myHex, theirHex, text) {
-  const content = await nip04Encrypt(secret, theirHex, text)
-  const evt = await signEvent({ pubkey: myHex, created_at: Math.floor(Date.now() / 1000), kind: 4, tags: [['p', theirHex]], content }, secret)
-  return publishEvent(evt)
+// Live kind-4 subscription (both directions) — the REQ stays open; onEvent fires
+// per event. Returns stop() to close the sockets.
+function subscribeDMs(myHex, theirHex, since, onEvent) {
+  const sockets = []
+  for (const url of RELAYS) {
+    let ws; try { ws = new WebSocket(url) } catch { continue }
+    const sub = 'dm' + (++SUBN)
+    ws.onopen = () => { try {
+      ws.send(JSON.stringify(['REQ', sub + 'a', { kinds: [4], authors: [theirHex], '#p': [myHex], since }]))
+      ws.send(JSON.stringify(['REQ', sub + 'b', { kinds: [4], authors: [myHex], '#p': [theirHex], since }]))
+    } catch {} }
+    ws.onmessage = (m) => { try { const d = JSON.parse(m.data); if (d[0] === 'EVENT' && String(d[1]).startsWith(sub)) onEvent(d[2]) } catch {} }
+    sockets.push(ws)
+  }
+  return () => sockets.forEach((ws) => { try { ws.close() } catch {} })
 }
 
 async function openDM(theirHex, theirName) {
@@ -346,29 +357,43 @@ async function openDM(theirHex, theirName) {
   if (!held) { toast('Import this key’s nsec (Keys tab) to send DMs', true); return }
   const dlg = document.createElement('dialog'); dlg.className = 'sheet dmsheet'
   dlg.innerHTML = `
-    <div class="dm-h"><b>${esc(theirName || theirHex.slice(0, 12) + '…')}</b><span class="dm-tag">NIP-04</span><button class="mini dm-reload" title="Reload">↻</button><button class="mini dm-close">✕</button></div>
+    <div class="dm-h"><b>${esc(theirName || theirHex.slice(0, 12) + '…')}</b><span class="dm-tag">NIP-04</span><span class="dm-live" title="Live — new messages appear automatically">● live</span><button class="mini dm-reload" title="Reload">↻</button><button class="mini dm-close">✕</button></div>
     <div class="dmthread"><div class="muted" style="padding:12px">Loading…</div></div>
     <div class="dminput"><input class="dm-text" placeholder="Encrypted message…" autocomplete="off"><button class="primary dm-send">Send</button></div>`
-  document.body.appendChild(dlg); dlg.addEventListener('close', () => dlg.remove())
+  document.body.appendChild(dlg)
   const thread = dlg.querySelector('.dmthread'), input = dlg.querySelector('.dm-text')
+  const seen = new Set(); let latest = 0, stopLive = null
+
+  async function addEvent(e) {
+    if (!e || !e.id || seen.has(e.id)) return
+    seen.add(e.id); if (e.created_at > latest) latest = e.created_at
+    let text; try { text = await nip04Decrypt(held.secret, theirHex, e.content) } catch { text = '🔒 (undecryptable)' }
+    const ph = thread.querySelector('.muted'); if (ph) ph.remove()
+    const m = document.createElement('div'); m.className = 'msg ' + (e.pubkey === myHex ? 'mine' : 'theirs'); m.textContent = text
+    thread.appendChild(m); thread.scrollTop = thread.scrollHeight
+  }
   async function load() {
+    if (stopLive) { stopLive(); stopLive = null }
+    seen.clear(); latest = 0; thread.innerHTML = '<div class="muted" style="padding:12px">Loading…</div>'
     const evs = await fetchDMs(myHex, theirHex)
     thread.innerHTML = ''
-    if (!evs.length) { thread.innerHTML = '<div class="muted" style="padding:12px">No messages yet. Say hi 👋</div>'; return }
-    for (const e of evs) {
-      let text; try { text = await nip04Decrypt(held.secret, theirHex, e.content) } catch { text = '🔒 (undecryptable)' }
-      const m = document.createElement('div'); m.className = 'msg ' + (e.pubkey === myHex ? 'mine' : 'theirs'); m.textContent = text
-      thread.appendChild(m)
-    }
-    thread.scrollTop = thread.scrollHeight
+    if (!evs.length) thread.innerHTML = '<div class="muted" style="padding:12px">No messages yet. Say hi 👋</div>'
+    for (const e of evs) await addEvent(e)
+    // standing subscription from just after the newest message we already have
+    stopLive = subscribeDMs(myHex, theirHex, (latest || Math.floor(Date.now() / 1000)) - 1, addEvent)
   }
   async function send() {
     const text = input.value.trim(); if (!text) return
     input.value = ''; input.disabled = true
-    try { const res = await sendDM(held.secret, myHex, theirHex, text); if (!res.filter((r) => r.ok).length) toast('No relay accepted the message', true) }
-    catch (e) { toast(String(e.message || e), true) }
-    input.disabled = false; input.focus(); await load()
+    try {
+      const content = await nip04Encrypt(held.secret, theirHex, text)
+      const evt = await signEvent({ pubkey: myHex, created_at: Math.floor(Date.now() / 1000), kind: 4, tags: [['p', theirHex]], content }, held.secret)
+      await addEvent(evt) // optimistic; the relay echo is deduped by id
+      if (!(await publishEvent(evt)).filter((r) => r.ok).length) toast('No relay accepted the message', true)
+    } catch (e) { toast(String(e.message || e), true) }
+    input.disabled = false; input.focus()
   }
+  dlg.addEventListener('close', () => { if (stopLive) stopLive(); dlg.remove() })
   dlg.querySelector('.dm-close').onclick = () => dlg.close()
   dlg.querySelector('.dm-reload').onclick = load
   dlg.querySelector('.dm-send').onclick = send
