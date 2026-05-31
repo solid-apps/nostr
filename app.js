@@ -305,6 +305,77 @@ async function loadLanHosts() {
   try { const r = await authFetch(LAN_HOSTS, { headers: { Accept: 'application/ld+json' } }); return r.ok ? await r.json() : null } catch { return null }
 }
 
+// ---- NIP-04 direct messages (POC) ----
+// AES-256-CBC with the X coordinate of the ECDH shared point as the key.
+// Metadata (the p-tag = recipient) is public; that's NIP-04's known tradeoff.
+const b64 = (bytes) => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s) }
+const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0))
+async function nip04Shared(skHex, pkHex) { const s = await secp(); return s.getSharedSecret(skHex, '02' + pkHex, true).slice(1, 33) }
+async function aesKey(raw) { return crypto.subtle.importKey('raw', raw, { name: 'AES-CBC' }, false, ['encrypt', 'decrypt']) }
+async function nip04Encrypt(skHex, pkHex, text) {
+  const key = await aesKey(await nip04Shared(skHex, pkHex))
+  const iv = crypto.getRandomValues(new Uint8Array(16))
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv }, key, new TextEncoder().encode(text)))
+  return b64(ct) + '?iv=' + b64(iv)
+}
+async function nip04Decrypt(skHex, pkHex, payload) {
+  const i = payload.indexOf('?iv='); if (i < 0) throw new Error('bad payload')
+  const key = await aesKey(await nip04Shared(skHex, pkHex))
+  const pt = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: unb64(payload.slice(i + 4)) }, key, unb64(payload.slice(0, i)))
+  return new TextDecoder().decode(pt)
+}
+// All kind-4 between me and them (both directions), oldest first.
+async function fetchDMs(myHex, theirHex) {
+  const [a, b] = await Promise.all([
+    reqAll({ kinds: [4], authors: [theirHex], '#p': [myHex], limit: 100 }),
+    reqAll({ kinds: [4], authors: [myHex], '#p': [theirHex], limit: 100 })
+  ])
+  const seen = new Set(), evs = []
+  for (const e of [...a, ...b]) if (e && !seen.has(e.id)) { seen.add(e.id); evs.push(e) }
+  return evs.sort((x, y) => x.created_at - y.created_at)
+}
+async function sendDM(secret, myHex, theirHex, text) {
+  const content = await nip04Encrypt(secret, theirHex, text)
+  const evt = await signEvent({ pubkey: myHex, created_at: Math.floor(Date.now() / 1000), kind: 4, tags: [['p', theirHex]], content }, secret)
+  return publishEvent(evt)
+}
+
+async function openDM(theirHex, theirName) {
+  const myHex = subjectHex()
+  const held = myHex ? KEYS.find((k) => k.pubkey === myHex && k.secret) : null
+  if (!held) { toast('Import this key’s nsec (Keys tab) to send DMs', true); return }
+  const dlg = document.createElement('dialog'); dlg.className = 'sheet dmsheet'
+  dlg.innerHTML = `
+    <div class="dm-h"><b>${esc(theirName || theirHex.slice(0, 12) + '…')}</b><span class="dm-tag">NIP-04</span><button class="mini dm-reload" title="Reload">↻</button><button class="mini dm-close">✕</button></div>
+    <div class="dmthread"><div class="muted" style="padding:12px">Loading…</div></div>
+    <div class="dminput"><input class="dm-text" placeholder="Encrypted message…" autocomplete="off"><button class="primary dm-send">Send</button></div>`
+  document.body.appendChild(dlg); dlg.addEventListener('close', () => dlg.remove())
+  const thread = dlg.querySelector('.dmthread'), input = dlg.querySelector('.dm-text')
+  async function load() {
+    const evs = await fetchDMs(myHex, theirHex)
+    thread.innerHTML = ''
+    if (!evs.length) { thread.innerHTML = '<div class="muted" style="padding:12px">No messages yet. Say hi 👋</div>'; return }
+    for (const e of evs) {
+      let text; try { text = await nip04Decrypt(held.secret, theirHex, e.content) } catch { text = '🔒 (undecryptable)' }
+      const m = document.createElement('div'); m.className = 'msg ' + (e.pubkey === myHex ? 'mine' : 'theirs'); m.textContent = text
+      thread.appendChild(m)
+    }
+    thread.scrollTop = thread.scrollHeight
+  }
+  async function send() {
+    const text = input.value.trim(); if (!text) return
+    input.value = ''; input.disabled = true
+    try { const res = await sendDM(held.secret, myHex, theirHex, text); if (!res.filter((r) => r.ok).length) toast('No relay accepted the message', true) }
+    catch (e) { toast(String(e.message || e), true) }
+    input.disabled = false; input.focus(); await load()
+  }
+  dlg.querySelector('.dm-close').onclick = () => dlg.close()
+  dlg.querySelector('.dm-reload').onclick = load
+  dlg.querySelector('.dm-send').onclick = send
+  input.onkeydown = (e) => { if (e.key === 'Enter') send() }
+  dlg.showModal(); load()
+}
+
 // ---- render ----
 const TABS = [
   { id: 'identity', emoji: '🪪', label: 'Identity' },
@@ -497,9 +568,13 @@ async function paintNetwork(p) {
         ${meta.nip05 ? `<small class="cmeta">${esc(meta.nip05)}</small>` : ''}
         ${webid ? `<small class="cmeta"><a href="${esc(webid)}" target="_blank" rel="noopener">${esc(webid)}</a></small>` : ''}
       </div>
-      <button class="mini ${following ? 'unfoll' : 'foll'}">${following ? 'Unfollow' : 'Follow'}</button>`
+      <div class="crow-actions">
+        <button class="mini dm" title="Message (NIP-04)">💬</button>
+        <button class="mini ${following ? 'unfoll' : 'foll'}">${following ? 'Unfollow' : 'Follow'}</button>
+      </div>`
     npub(pubkey).then((v) => { const e = el.querySelector('.cnpub'); if (e) e.textContent = v || pubkey })
-    el.querySelector('button').onclick = following ? () => doUnfollow(pubkey, webid) : () => doFollow({ pubkey, webid })
+    el.querySelector('.foll, .unfoll').onclick = following ? () => doUnfollow(pubkey, webid) : () => doFollow({ pubkey, webid })
+    el.querySelector('.dm').onclick = () => openDM(pubkey, meta.name || meta.display_name)
     return el
   }
   function renderFollows() {
