@@ -125,6 +125,26 @@ h3 { font-size: .98rem; margin: 18px 0 4px; }
 .pubres small { color: var(--muted); font-size: .76rem; }
 .evid { font-size: .76rem; margin-top: 4px; }
 
+/* network / contacts */
+.netadd { display: flex; flex-direction: column; gap: 8px; }
+.netadd .fl { font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); font-weight: 700; }
+.netadd input { font: inherit; color: var(--text); background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; flex: 1; min-width: 180px; }
+.netadd input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.netsec-h { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; font-size: .95rem; }
+.netsec-h .disc { margin-left: auto; }
+.cnt { background: var(--accent-soft); color: var(--accent); font-size: .72rem; font-weight: 700; padding: 1px 9px; border-radius: 999px; }
+.card.contact { display: flex; align-items: center; gap: 12px; padding: 11px 14px; }
+.cav { width: 40px; height: 40px; border-radius: 12px; object-fit: cover; background: var(--surface); border: 1px solid var(--border); flex: 0 0 auto; }
+.cmain { flex: 1; min-width: 0; }
+.cname { display: flex; align-items: center; gap: 7px; }
+.cname b { font-size: .95rem; }
+.badge.wv { background: #e6f7ee; color: var(--ok); font-size: .66rem; font-weight: 700; padding: 1px 7px; border-radius: 999px; }
+.contact .cnpub { display: block; color: var(--dim); font-size: .74rem; }
+.cmeta { display: block; color: var(--muted); font-size: .76rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmeta a { color: var(--accent); text-decoration: none; }
+.contact .foll { background: var(--accent); color: #fff; }
+.contact .foll:hover { filter: brightness(1.06); background: var(--accent); color: #fff; }
+
 /* relays */
 .card.relay { display: flex; align-items: center; gap: 10px; padding: 11px 14px; }
 .card.relay code { flex: 1; }

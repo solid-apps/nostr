@@ -27,6 +27,7 @@ const KEYSTORE = new URL('../../../private/nostr/keys.jsonld', location.href)
 const PRIV_DIR = new URL('../../../private/nostr/', location.href)
 const POD_ROOT = new URL('../../../', location.href)
 const PROFILE_DIR = new URL('../../../profile/', location.href)
+const LAN_HOSTS = new URL('../../../private/net/hosts.jsonld', location.href) // written by `podscan`
 
 // --- canonical-key plumbing (hex is the source of truth) ---
 const isHex64 = (s) => /^[0-9a-f]{64}$/i.test(s || '')
@@ -56,6 +57,8 @@ let TAB = 'identity'
 let ECO = null       // wider Nostr ecosystem directory (lazy-loaded JSON)
 let ECO_CAT = 'All'
 let PROFILE = null   // working kind-0 metadata model for the Profile tab
+let FOLLOWS = []     // [{ pubkey, relay, petname }] — my kind-3 contact list
+let NET = null       // { profiles:{hex:meta}, webids:{hex:url}, discovered:[meta], loaded }
 
 const toast = (m, err) => { let t = document.querySelector('.toast'); if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t) } t.className = 'toast' + (err ? ' error' : ''); t.textContent = m; requestAnimationFrame(() => t.classList.add('show')); setTimeout(() => t.classList.remove('show'), 2400) }
 async function copy(t) { try { await navigator.clipboard.writeText(t); toast('Copied') } catch { toast('Copy failed', true) } }
@@ -162,10 +165,8 @@ function firstOf(obj, keys) { for (const k of keys) { const v = obj && obj[k]; i
 function cardName() { return CARDDOC ? firstOf(CARDDOC, ['name', 'foaf:name', 'http://xmlns.com/foaf/0.1/name', 'vcard:fn', 'fn']) : null }
 function cardAvatar() { return CARDDOC ? firstOf(CARDDOC, ['img', 'foaf:img', 'http://xmlns.com/foaf/0.1/img', 'picture', 'vcard:hasPhoto', 'hasPhoto']) : null }
 
-// Additive, namespaced write-back so the WebID card mirrors the Nostr profile.
-async function writeProfileToCard(name, picture) {
-  if (!CARDDOC) await loadCard()
-  if (!CARDDOC) throw new Error('No profile card to update')
+// Ensure the card's @context defines the foaf prefix (additive, idempotent).
+function ensureFoafCtx() {
   let ctx = CARDDOC['@context']
   if (ctx == null) ctx = [{}]
   if (typeof ctx === 'string') ctx = [ctx, {}]
@@ -173,11 +174,36 @@ async function writeProfileToCard(name, picture) {
   const cobj = ctx.find((c) => c && typeof c === 'object')
   cobj.foaf = cobj.foaf || 'http://xmlns.com/foaf/0.1/'
   CARDDOC['@context'] = ctx
+}
+async function putCard() {
+  const r = await authFetch(CARD, { method: 'PUT', headers: { 'Content-Type': 'application/ld+json' }, body: JSON.stringify(CARDDOC, null, 2) })
+  if (!r.ok) throw new Error('card write ' + r.status)
+}
+
+// Additive, namespaced write-back so the WebID card mirrors the Nostr profile.
+async function writeProfileToCard(name, picture) {
+  if (!CARDDOC) await loadCard()
+  if (!CARDDOC) throw new Error('No profile card to update')
+  ensureFoafCtx()
   // Update an existing name/img key if the card already uses one, else use foaf:*.
   if (name) { const k = ['name', 'foaf:name'].find((x) => x in CARDDOC) || 'foaf:name'; CARDDOC[k] = name }
   if (picture) { const k = ['img', 'foaf:img'].find((x) => x in CARDDOC) || 'foaf:img'; CARDDOC[k] = { '@id': picture } }
-  const r = await authFetch(CARD, { method: 'PUT', headers: { 'Content-Type': 'application/ld+json' }, body: JSON.stringify(CARDDOC, null, 2) })
-  if (!r.ok) throw new Error('card write ' + r.status)
+  await putCard()
+}
+
+// Mirror the social graph into the WebID: foaf:knows ⇄ kind-3 follows.
+function cardKnows() {
+  if (!CARDDOC) return []
+  const k = ['foaf:knows', 'knows'].find((x) => x in CARDDOC)
+  return k ? toArr(CARDDOC[k]).map((v) => (v && v['@id']) || v).filter(Boolean) : []
+}
+async function setCardKnows(webids) {
+  if (!CARDDOC) await loadCard()
+  if (!CARDDOC) throw new Error('No profile card to update')
+  ensureFoafCtx()
+  const k = ['foaf:knows', 'knows'].find((x) => x in CARDDOC) || 'foaf:knows'
+  CARDDOC[k] = [...new Set(webids)].map((id) => ({ '@id': id }))
+  await putCard()
 }
 
 // Upload an image into the pod's /profile/ and return its URL (so WebID + Nostr share one file).
@@ -198,10 +224,92 @@ async function writeWellKnown(hex) {
   return r.ok
 }
 
+// ---- contacts / network (kind 3 follows, kind 0 discovery) ----
+let SUBN = 0
+// Generic REQ to one relay; collects matching events until EOSE/timeout.
+function reqRelay(url, filter, capMs) {
+  return new Promise((resolve) => {
+    const out = []; let done = false
+    const fin = (ws, t) => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close() } catch {} resolve(out) }
+    try {
+      const ws = new WebSocket(url); const sub = 's' + (++SUBN)
+      const t = setTimeout(() => fin(ws), capMs || 6000)
+      ws.onopen = () => ws.send(JSON.stringify(['REQ', sub, filter]))
+      ws.onmessage = (m) => { try { const d = JSON.parse(m.data); if (d[0] === 'EVENT' && d[1] === sub) out.push(d[2]); else if ((d[0] === 'EOSE' || d[0] === 'CLOSED') && d[1] === sub) fin(ws, t) } catch {} }
+      ws.onerror = () => fin(ws, t)
+    } catch { resolve([]) }
+  })
+}
+async function reqAll(filter, capMs) { return (await Promise.all(RELAYS.map((u) => reqRelay(u, filter, capMs)))).flat() }
+
+// newest kind-0 per pubkey from a set of events → { hex: contentObj }
+function newestByAuthor(evs) {
+  const map = {}
+  for (const e of evs) { if (!map[e.pubkey] || e.created_at > map[e.pubkey]._ct) { try { const c = JSON.parse(e.content); c._ct = e.created_at; c.pubkey = e.pubkey; map[e.pubkey] = c } catch {} } }
+  return map
+}
+async function fetchProfiles(hexes) { if (!hexes.length) return {}; return newestByAuthor(await reqAll({ authors: hexes, kinds: [0], limit: hexes.length * 3 })) }
+
+// My latest kind-3 contact list → array of { pubkey, relay, petname }.
+async function loadFollows(hex) {
+  const evs = (await reqAll({ authors: [hex], kinds: [3], limit: 1 })).sort((a, b) => b.created_at - a.created_at)
+  const latest = evs[0]
+  return latest ? toArr(latest.tags).filter((t) => t[0] === 'p').map((t) => ({ pubkey: t[1], relay: t[2] || '', petname: t[3] || '' })) : []
+}
+async function publishFollows() {
+  const hex = subjectHex(); const held = KEYS.find((k) => k.pubkey === hex && k.secret)
+  if (!held) throw new Error('No held secret to sign with')
+  const tags = FOLLOWS.map((f) => ['p', f.pubkey, f.relay || '', f.petname || ''])
+  const evt = await signEvent({ pubkey: hex, created_at: Math.floor(Date.now() / 1000), kind: 3, tags, content: '' }, held.secret)
+  return publishEvent(evt)
+}
+
+// "Who they really are": resolve a pubkey to a verified WebID via the bidirectional
+// link — their pod's card must assert this key (verificationMethod + authentication).
+async function resolveWebID(pubkey, profile) {
+  const site = profile && profile.website
+  if (!site) return null
+  try {
+    const base = site.endsWith('/') ? site : site + '/'
+    const cardUrl = site.includes('card.jsonld') ? site : new URL('profile/card.jsonld', base).href
+    const r = await authFetch(cardUrl, { headers: { Accept: 'application/ld+json' } })
+    if (!r.ok) return null
+    const doc = await r.json()
+    const auth = toArr(doc.authentication).map((a) => (a && a['@id']) || a)
+    const ok = toArr(doc.verificationMethod).some((vm) => hexFromMb(vm.publicKeyMultibase) === pubkey && auth.includes(vm['@id']))
+    return ok ? (doc['@id'] || cardUrl) : null
+  } catch { return null }
+}
+
+// Add a contact from an npub, hex, or WebID/pod URL → resolves pubkey (+ WebID).
+async function resolveInput(raw) {
+  raw = raw.trim()
+  if (raw.toLowerCase().startsWith('npub')) { const d = await decodeBech(raw); if (d.prefix !== 'npub') throw new Error('not an npub'); return { pubkey: d.hex } }
+  if (isHex64(raw)) return { pubkey: raw.toLowerCase() }
+  if (/^https?:\/\//.test(raw)) {
+    const base = raw.endsWith('/') ? raw : raw + '/'
+    const cardUrl = raw.includes('card.jsonld') ? raw : new URL('profile/card.jsonld', base).href
+    const r = await authFetch(cardUrl, { headers: { Accept: 'application/ld+json' } })
+    if (!r.ok) throw new Error('could not read that WebID (' + r.status + ')')
+    const doc = await r.json()
+    const vm = toArr(doc.verificationMethod).map((v) => hexFromMb(v.publicKeyMultibase)).find(Boolean)
+    if (!vm) throw new Error('that WebID declares no Nostr key')
+    return { pubkey: vm, webid: doc['@id'] || cardUrl }
+  }
+  throw new Error('paste an npub, 64-hex, or a WebID / pod URL')
+}
+
+// The LAN directory written by `podscan` into /private — verified local
+// identities (pubkey ⇄ WebID) behind the relays on your network.
+async function loadLanHosts() {
+  try { const r = await authFetch(LAN_HOSTS, { headers: { Accept: 'application/ld+json' } }); return r.ok ? await r.json() : null } catch { return null }
+}
+
 // ---- render ----
 const TABS = [
   { id: 'identity', emoji: '🪪', label: 'Identity' },
   { id: 'profile', emoji: '🦤', label: 'Profile' },
+  { id: 'network', emoji: '🤝', label: 'Network' },
   { id: 'keys', emoji: '🔑', label: 'Keys' },
   { id: 'apps', emoji: '🧩', label: 'Apps' },
   { id: 'relays', emoji: '📡', label: 'Relays' },
@@ -225,7 +333,7 @@ function paint() {
     tabs.appendChild(b)
   })
   const panel = appEl.querySelector('.panel')
-  ;({ identity: paintIdentity, profile: paintProfile, keys: paintKeys, apps: paintApps, relays: paintRelays, guide: paintGuide }[TAB])(panel)
+  ;({ identity: paintIdentity, profile: paintProfile, network: paintNetwork, keys: paintKeys, apps: paintApps, relays: paintRelays, guide: paintGuide }[TAB])(panel)
 }
 
 function check(ok, label, detail) {
@@ -351,6 +459,141 @@ function paintProfile(p) {
     } catch (e) { status.innerHTML = `<div class="warn">Publish failed: ${esc(e.message || e)}</div>`; toast('Publish failed', true) }
     finally { pubBtn.disabled = false }
   }
+}
+
+async function paintNetwork(p) {
+  const hex = subjectHex()
+  const held = hex ? KEYS.find((k) => k.pubkey === hex && k.secret) : null
+  if (!hex) { p.innerHTML = '<h2>Network</h2><div class="empty">No key yet. Generate or import one in the <b>Keys</b> tab first.</div>'; return }
+  p.innerHTML = `
+    <h2>Network</h2>
+    <p class="sub muted">Follow other identities — found live on your relays, verified by their <b>WebID</b>. Follows publish as a Nostr contact list (kind&nbsp;3) and mirror into your card as <code>foaf:knows</code>. The groundwork for DMs.</p>
+    ${held ? '' : '<div class="warn">This app doesn’t hold the secret for your active key, so it can’t publish follows. Import its <code>nsec</code> in the <b>Keys</b> tab. <button class="mini gokeys" style="margin-left:6px">🔑 Keys</button></div>'}
+    <div class="netadd card">
+      <span class="fl">Add by npub or WebID</span>
+      <div class="avrow"><input class="f-add" placeholder="npub1… · 64-hex · https://their-pod/"><button class="mini addbtn">Follow</button></div>
+    </div>
+    <div class="netsec-h"><b>Following</b> <span class="cnt foll-cnt">·</span></div>
+    <div class="follow-list"><div class="muted" style="padding:8px">Loading your contacts…</div></div>
+    <div class="netsec-h"><b>On your LAN</b><button class="mini lan">🌐 Refresh</button></div>
+    <div class="lan-list"><div class="muted" style="padding:8px">Local identities from <code>podscan</code> (<code>/private/net/hosts.jsonld</code>).</div></div>
+    <div class="netsec-h"><b>Discover on relays</b><button class="mini disc">↻ Scan relays</button></div>
+    <div class="discover-list"><div class="muted" style="padding:8px">Scan your relays to find identities to follow.</div></div>`
+
+  const fl = p.querySelector('.follow-list'), dl = p.querySelector('.discover-list'), ll = p.querySelector('.lan-list'), flcnt = p.querySelector('.foll-cnt')
+  const gk = p.querySelector('.gokeys'); if (gk) gk.onclick = () => { TAB = 'keys'; paint() }
+
+  function contactRow(pubkey, following) {
+    const meta = (NET && NET.profiles[pubkey]) || {}
+    const webid = NET && NET.webids[pubkey]
+    const name = esc(meta.name || meta.display_name || (pubkey.slice(0, 10) + '…'))
+    const el = document.createElement('div'); el.className = 'card contact'
+    el.innerHTML = `
+      <img class="cav" ${meta.picture ? `src="${esc(meta.picture)}"` : 'style="display:none"'} alt="">
+      <div class="cmain">
+        <div class="cname"><b>${name}</b>${webid ? '<span class="badge wv">✓ WebID</span>' : ''}</div>
+        <code class="mono cnpub" data-hex="${esc(pubkey)}">…</code>
+        ${meta._lan ? `<small class="cmeta">🌐 ${esc(meta._lan)}</small>` : ''}
+        ${meta.nip05 ? `<small class="cmeta">${esc(meta.nip05)}</small>` : ''}
+        ${webid ? `<small class="cmeta"><a href="${esc(webid)}" target="_blank" rel="noopener">${esc(webid)}</a></small>` : ''}
+      </div>
+      <button class="mini ${following ? 'unfoll' : 'foll'}">${following ? 'Unfollow' : 'Follow'}</button>`
+    npub(pubkey).then((v) => { const e = el.querySelector('.cnpub'); if (e) e.textContent = v || pubkey })
+    el.querySelector('button').onclick = following ? () => doUnfollow(pubkey, webid) : () => doFollow({ pubkey, webid })
+    return el
+  }
+  function renderFollows() {
+    flcnt.textContent = FOLLOWS.length
+    fl.innerHTML = ''
+    if (!FOLLOWS.length) { fl.innerHTML = '<div class="empty">Not following anyone yet. Discover people below, or add by npub / WebID.</div>'; return }
+    FOLLOWS.forEach((f) => fl.appendChild(contactRow(f.pubkey, true)))
+  }
+  function renderDiscover() {
+    dl.innerHTML = ''
+    const followingSet = new Set(FOLLOWS.map((f) => f.pubkey))
+    const fresh = ((NET && NET.discovered) || []).filter((m) => m.pubkey !== hex && !followingSet.has(m.pubkey))
+    if (!fresh.length) { dl.innerHTML = '<div class="empty">Scan your relays to find identities to follow.</div>'; return }
+    fresh.forEach((m) => { NET.profiles[m.pubkey] = m; dl.appendChild(contactRow(m.pubkey, false)) })
+  }
+  async function enrichWebIDs(metas) {
+    await Promise.all(metas.filter((m) => m && m.website).slice(0, 24).map(async (m) => { const w = await resolveWebID(m.pubkey, m); if (w && NET) NET.webids[m.pubkey] = w }))
+  }
+
+  function renderLAN() {
+    ll.innerHTML = ''
+    const doc = NET.lanDoc
+    if (!doc) { ll.innerHTML = '<div class="empty">No LAN directory yet. Run <code>podscan scan</code> on this pod’s host to populate <code>/private/net/hosts.jsonld</code>.</div>'; return }
+    const followingSet = new Set(FOLLOWS.map((f) => f.pubkey))
+    const ids = []
+    for (const h of toArr(doc.hosts)) { const relay = (toArr(h.services)[0] || {}).relay; for (const id of toArr(h.identities)) if (id && id.pubkey) ids.push({ ...id, _host: h.hostname || h.ip, _relay: relay }) }
+    const fresh = ids.filter((i) => i.pubkey !== hex && !followingSet.has(i.pubkey))
+    if (!ids.length) { ll.innerHTML = '<div class="empty">No identities advertised on your LAN yet (no relays found on the scanned hosts).</div>'; return }
+    if (!fresh.length) { ll.innerHTML = '<div class="empty">Everyone on your LAN is already followed.</div>'; return }
+    fresh.forEach((i) => {
+      NET.profiles[i.pubkey] = Object.assign(NET.profiles[i.pubkey] || {}, { pubkey: i.pubkey, name: i.name, _lan: i._host + (i._relay ? ' · ' + i._relay : '') })
+      if (i.webid) NET.webids[i.pubkey] = i.webid
+      if (i._relay) NET.relayHints[i.pubkey] = i._relay
+      ll.appendChild(contactRow(i.pubkey, false))
+    })
+  }
+  async function loadLAN(force) {
+    if (NET.lanDoc && !force) { renderLAN(); return }
+    ll.innerHTML = '<div class="muted" style="padding:8px">Reading pod directory…</div>'
+    NET.lanDoc = await loadLanHosts()
+    renderLAN()
+  }
+
+  async function doFollow(c) {
+    if (!held) { toast('Import this key’s nsec to publish follows', true); return }
+    if (FOLLOWS.some((f) => f.pubkey === c.pubkey)) { toast('Already following'); return }
+    toast('Following…')
+    let webid = c.webid || (await resolveWebID(c.pubkey, NET.profiles[c.pubkey]))
+    if (webid) NET.webids[c.pubkey] = webid
+    FOLLOWS.push({ pubkey: c.pubkey, relay: c.relay || (NET.relayHints && NET.relayHints[c.pubkey]) || '', petname: '' })
+    try {
+      const res = await publishFollows()
+      const ok = res.filter((r) => r.ok).length
+      let mirror = ''
+      if (webid) { try { await setCardKnows([...cardKnows(), webid]); await loadCard(); mirror = ' · WebID linked' } catch { mirror = ' · (foaf:knows failed)' } }
+      if (!NET.profiles[c.pubkey]) Object.assign(NET.profiles, await fetchProfiles([c.pubkey]))
+      toast(ok ? `Following (${ok}/${res.length} relays)${mirror}` : 'No relay accepted the follow', !ok)
+    } catch (e) { FOLLOWS = FOLLOWS.filter((f) => f.pubkey !== c.pubkey); toast(String(e.message || e), true) }
+    renderFollows(); renderDiscover()
+  }
+  async function doUnfollow(pubkey, webid) {
+    if (!held) { toast('Import this key’s nsec first', true); return }
+    if (!confirm('Unfollow this identity?')) return
+    const prev = FOLLOWS
+    FOLLOWS = FOLLOWS.filter((f) => f.pubkey !== pubkey)
+    try {
+      const res = await publishFollows()
+      if (webid) { try { await setCardKnows(cardKnows().filter((w) => w !== webid)); await loadCard() } catch {} }
+      const ok = res.filter((r) => r.ok).length
+      toast(ok ? `Unfollowed (${ok}/${res.length})` : 'Unfollow not accepted', !ok)
+    } catch (e) { FOLLOWS = prev; toast(String(e.message || e), true) }
+    renderFollows(); renderDiscover()
+  }
+
+  p.querySelector('.addbtn').onclick = async () => {
+    const inp = p.querySelector('.f-add'); const raw = inp.value.trim(); if (!raw) return
+    try { const c = await resolveInput(raw); inp.value = ''; await doFollow(c) } catch (e) { toast(String(e.message || e), true) }
+  }
+  p.querySelector('.lan').onclick = () => loadLAN(true)
+  p.querySelector('.disc').onclick = async () => {
+    dl.innerHTML = '<div class="muted" style="padding:8px">Scanning relays…</div>'
+    NET.discovered = Object.values(newestByAuthor(await reqAll({ kinds: [0], limit: 40 }, 6000)))
+    renderDiscover()
+    await enrichWebIDs(NET.discovered); renderDiscover()
+  }
+
+  // lazy initial load of my follow graph (once; cached in NET across re-paints)
+  if (!NET) {
+    NET = { profiles: {}, webids: {}, relayHints: {}, discovered: [], lanDoc: null }
+    FOLLOWS = await loadFollows(hex)
+    NET.profiles = await fetchProfiles(FOLLOWS.map((f) => f.pubkey))
+    await enrichWebIDs(Object.values(NET.profiles))
+  }
+  renderFollows(); renderDiscover(); loadLAN(false)
 }
 
 function paintKeys(p) {
