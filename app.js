@@ -137,7 +137,7 @@ function publishToRelay(url, evt) {
     } catch (e) { resolve({ url, ok: false, msg: String(e.message || e) }) }
   })
 }
-async function publishEvent(evt) { return Promise.all(RELAYS.map((u) => publishToRelay(u, evt))) }
+async function publishEvent(evt, relays = RELAYS) { return Promise.all(relays.map((u) => publishToRelay(u, evt))) }
 
 // Best-effort fetch of the newest kind-0 for a pubkey across relays (to prefill the form).
 function fetchKind0FromRelay(url, hex) {
@@ -240,7 +240,7 @@ function reqRelay(url, filter, capMs) {
     } catch { resolve([]) }
   })
 }
-async function reqAll(filter, capMs) { return (await Promise.all(RELAYS.map((u) => reqRelay(u, filter, capMs)))).flat() }
+async function reqAll(filter, capMs, relays = RELAYS) { return (await Promise.all(relays.map((u) => reqRelay(u, filter, capMs)))).flat() }
 
 // newest kind-0 per pubkey from a set of events → { hex: contentObj }
 function newestByAuthor(evs) {
@@ -325,20 +325,29 @@ async function nip04Decrypt(skHex, pkHex, payload) {
   return new TextDecoder().decode(pt)
 }
 // All kind-4 between me and them (both directions), oldest first.
-async function fetchDMs(myHex, theirHex) {
+async function fetchDMs(myHex, theirHex, relays) {
   const [a, b] = await Promise.all([
-    reqAll({ kinds: [4], authors: [theirHex], '#p': [myHex], limit: 100 }),
-    reqAll({ kinds: [4], authors: [myHex], '#p': [theirHex], limit: 100 })
+    reqAll({ kinds: [4], authors: [theirHex], '#p': [myHex], limit: 100 }, undefined, relays),
+    reqAll({ kinds: [4], authors: [myHex], '#p': [theirHex], limit: 100 }, undefined, relays)
   ])
   const seen = new Set(), evs = []
   for (const e of [...a, ...b]) if (e && !seen.has(e.id)) { seen.add(e.id); evs.push(e) }
   return evs.sort((x, y) => x.created_at - y.created_at)
 }
+
+// My pod's own relay (reachable as the page's origin) and a contact's LAN relay.
+function myRelayUrl() { return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/relay' }
+function contactLanRelay(pubkey) {
+  const f = FOLLOWS.find((x) => x.pubkey === pubkey); if (f && f.relay) return f.relay
+  if (NET && NET.relayHints && NET.relayHints[pubkey]) return NET.relayHints[pubkey]
+  if (NET && NET.lanDoc) for (const h of toArr(NET.lanDoc.hosts)) if (toArr(h.identities).some((i) => i.pubkey === pubkey)) { const r = (toArr(h.services)[0] || {}).relay; if (r) return r }
+  return null
+}
 // Live kind-4 subscription (both directions) — the REQ stays open; onEvent fires
 // per event. Returns stop() to close the sockets.
-function subscribeDMs(myHex, theirHex, since, onEvent) {
+function subscribeDMs(myHex, theirHex, since, onEvent, relays = RELAYS) {
   const sockets = []
-  for (const url of RELAYS) {
+  for (const url of relays) {
     let ws; try { ws = new WebSocket(url) } catch { continue }
     const sub = 'dm' + (++SUBN)
     ws.onopen = () => { try {
@@ -355,9 +364,12 @@ async function openDM(theirHex, theirName) {
   const myHex = subjectHex()
   const held = myHex ? KEYS.find((k) => k.pubkey === myHex && k.secret) : null
   if (!held) { toast('Import this key’s nsec (Keys tab) to send DMs', true); return }
+  const theirRelay = contactLanRelay(theirHex)
+  let lanOnly = false
+  const dmRelays = () => lanOnly ? [...new Set([myRelayUrl(), theirRelay].filter(Boolean))] : RELAYS
   const dlg = document.createElement('dialog'); dlg.className = 'sheet dmsheet'
   dlg.innerHTML = `
-    <div class="dm-h"><b>${esc(theirName || theirHex.slice(0, 12) + '…')}</b><span class="dm-tag">NIP-04</span><span class="dm-live" title="Live — new messages appear automatically">● live</span><button class="mini dm-reload" title="Reload">↻</button><button class="mini dm-close">✕</button></div>
+    <div class="dm-h"><b>${esc(theirName || theirHex.slice(0, 12) + '…')}</b><span class="dm-tag">NIP-04</span><span class="dm-live" title="Live — new messages appear automatically">● live</span>${theirRelay ? '<button class="mini dm-lan" title="Route this chat over your LAN relays only — never touches a public relay">🌐 all</button>' : ''}<button class="mini dm-reload" title="Reload">↻</button><button class="mini dm-close">✕</button></div>
     <div class="dmthread"><div class="muted" style="padding:12px">Loading…</div></div>
     <div class="dminput"><input class="dm-text" placeholder="Encrypted message…" autocomplete="off"><button class="primary dm-send">Send</button></div>`
   document.body.appendChild(dlg)
@@ -375,12 +387,13 @@ async function openDM(theirHex, theirName) {
   async function load() {
     if (stopLive) { stopLive(); stopLive = null }
     seen.clear(); latest = 0; thread.innerHTML = '<div class="muted" style="padding:12px">Loading…</div>'
-    const evs = await fetchDMs(myHex, theirHex)
+    const relays = dmRelays()
+    const evs = await fetchDMs(myHex, theirHex, relays)
     thread.innerHTML = ''
     if (!evs.length) thread.innerHTML = '<div class="muted" style="padding:12px">No messages yet. Say hi 👋</div>'
     for (const e of evs) await addEvent(e)
     // standing subscription from just after the newest message we already have
-    stopLive = subscribeDMs(myHex, theirHex, (latest || Math.floor(Date.now() / 1000)) - 1, addEvent)
+    stopLive = subscribeDMs(myHex, theirHex, (latest || Math.floor(Date.now() / 1000)) - 1, addEvent, relays)
   }
   async function send() {
     const text = input.value.trim(); if (!text) return
@@ -389,13 +402,22 @@ async function openDM(theirHex, theirName) {
       const content = await nip04Encrypt(held.secret, theirHex, text)
       const evt = await signEvent({ pubkey: myHex, created_at: Math.floor(Date.now() / 1000), kind: 4, tags: [['p', theirHex]], content }, held.secret)
       await addEvent(evt) // optimistic; the relay echo is deduped by id
-      if (!(await publishEvent(evt)).filter((r) => r.ok).length) toast('No relay accepted the message', true)
+      if (!(await publishEvent(evt, dmRelays())).filter((r) => r.ok).length) toast('No relay accepted the message', true)
     } catch (e) { toast(String(e.message || e), true) }
     input.disabled = false; input.focus()
   }
   dlg.addEventListener('close', () => { if (stopLive) stopLive(); dlg.remove() })
   dlg.querySelector('.dm-close').onclick = () => dlg.close()
   dlg.querySelector('.dm-reload').onclick = load
+  const lanBtn = dlg.querySelector('.dm-lan')
+  if (lanBtn) lanBtn.onclick = () => {
+    lanOnly = !lanOnly
+    lanBtn.textContent = lanOnly ? '🔒 LAN' : '🌐 all'
+    lanBtn.classList.toggle('on', lanOnly)
+    lanBtn.title = lanOnly ? ('LAN only — ' + dmRelays().join(', ')) : 'Route this chat over your LAN relays only — never touches a public relay'
+    toast(lanOnly ? 'This chat now uses your LAN relays only' : 'This chat uses all your relays')
+    load()
+  }
   dlg.querySelector('.dm-send').onclick = send
   input.onkeydown = (e) => { if (e.key === 'Enter') send() }
   dlg.showModal(); load()
